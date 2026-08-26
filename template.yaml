@@ -1,0 +1,78 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Fault-tolerant serverless order processing pipeline (Order Intake -> SQS -> Order Processing -> SQS -> Notification),
+  backed by DynamoDB, with a DLQ and CloudWatch observability. See PROJECT.md for architectural decisions.
+
+Globals:
+  Function:
+    Runtime: python3.14
+    Timeout: 10
+
+Resources:
+  OrdersTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${AWS::StackName}-Orders"
+      BillingMode: PROVISIONED
+      ProvisionedThroughput:
+        ReadCapacityUnits: 3
+        WriteCapacityUnits: 3
+      AttributeDefinitions:
+        - AttributeName: order_id
+          AttributeType: S
+        - AttributeName: status
+          AttributeType: S
+        - AttributeName: created_at
+          AttributeType: S
+        - AttributeName: customer_email
+          AttributeType: S
+      KeySchema:
+        - AttributeName: order_id
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: StatusCreatedAtIndex
+          KeySchema:
+            - AttributeName: status
+              KeyType: HASH
+            - AttributeName: created_at
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+          ProvisionedThroughput:
+            ReadCapacityUnits: 1
+            WriteCapacityUnits: 1
+        - IndexName: CustomerEmailCreatedAtIndex
+          KeySchema:
+            - AttributeName: customer_email
+              KeyType: HASH
+            - AttributeName: created_at
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+          ProvisionedThroughput:
+            ReadCapacityUnits: 1
+            WriteCapacityUnits: 1
+
+  OrderIntakeFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-order-intake"
+      CodeUri: order_intake/
+      Handler: app.lambda_handler
+      Environment:
+        Variables:
+          ORDERS_TABLE_NAME: !Ref OrdersTable
+      Policies:
+        - DynamoDBWritePolicy:
+            TableName: !Ref OrdersTable
+      FunctionUrlConfig:
+        AuthType: NONE
+
+Outputs:
+  OrderIntakeFunctionUrl:
+    Description: Public HTTP endpoint for submitting orders (POST)
+    Value: !GetAtt OrderIntakeFunction.FunctionUrl
+  OrdersTableName:
+    Description: Name of the Orders DynamoDB table
+    Value: !Ref OrdersTable
