@@ -4,6 +4,14 @@ Description: >
   Fault-tolerant serverless order processing pipeline (Order Intake -> SQS -> Order Processing -> SQS -> Notification),
   backed by DynamoDB, with a DLQ and CloudWatch observability. See PROJECT.md for architectural decisions.
 
+Parameters:
+  PaymentFailureRate:
+    Type: String
+    Default: "0"
+    Description: >
+      Probability (0.0-1.0) that the mock payment step in Order Processing simulates a
+      failure. Defaults to 0 (never fails); overridden during chaos testing.
+
 Globals:
   Function:
     Runtime: python3.14
@@ -54,6 +62,29 @@ Resources:
             ReadCapacityUnits: 1
             WriteCapacityUnits: 1
 
+  InventoryTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${AWS::StackName}-Inventory"
+      BillingMode: PROVISIONED
+      ProvisionedThroughput:
+        ReadCapacityUnits: 3
+        WriteCapacityUnits: 3
+      AttributeDefinitions:
+        - AttributeName: item_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: item_id
+          KeyType: HASH
+
+  OrdersQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "${AWS::StackName}-orders-queue"
+      # Well above tenacity's future ~10s in-process retry window (Phase 3), so tenacity
+      # always finishes before SQS could redeliver. See PROJECT.md's retry strategy section.
+      VisibilityTimeout: 60
+
   OrderIntakeFunction:
     Type: AWS::Serverless::Function
     Properties:
@@ -63,11 +94,39 @@ Resources:
       Environment:
         Variables:
           ORDERS_TABLE_NAME: !Ref OrdersTable
+          ORDERS_QUEUE_URL: !Ref OrdersQueue
       Policies:
         - DynamoDBWritePolicy:
             TableName: !Ref OrdersTable
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt OrdersQueue.QueueName
       FunctionUrlConfig:
         AuthType: NONE
+
+  OrderProcessingFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-order-processing"
+      CodeUri: order_processing/
+      Handler: app.lambda_handler
+      Environment:
+        Variables:
+          ORDERS_TABLE_NAME: !Ref OrdersTable
+          INVENTORY_TABLE_NAME: !Ref InventoryTable
+          PAYMENT_FAILURE_RATE: !Ref PaymentFailureRate
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref OrdersTable
+        - DynamoDBWritePolicy:
+            TableName: !Ref OrdersTable
+        - DynamoDBWritePolicy:
+            TableName: !Ref InventoryTable
+      Events:
+        OrdersQueueEvent:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt OrdersQueue.Arn
+            BatchSize: 1
 
 Outputs:
   OrderIntakeFunctionUrl:
@@ -76,3 +135,9 @@ Outputs:
   OrdersTableName:
     Description: Name of the Orders DynamoDB table
     Value: !Ref OrdersTable
+  InventoryTableName:
+    Description: Name of the Inventory DynamoDB table
+    Value: !Ref InventoryTable
+  OrdersQueueUrl:
+    Description: URL of the SQS queue between Order Intake and Order Processing
+    Value: !Ref OrdersQueue

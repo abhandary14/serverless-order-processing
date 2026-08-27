@@ -94,6 +94,22 @@ class OrderRepository:
         self._table.put_item(Item=order.to_item())
 
 
+class OrderQueue:
+    """Publishes newly received orders for Order Processing to pick up."""
+
+    def __init__(self, sqs_client, queue_url: str):
+        """Wrap an SQS client, targeting the given queue URL."""
+        self._sqs = sqs_client
+        self._queue_url = queue_url
+
+    def publish(self, order: Order) -> None:
+        """Send a message pointing Order Processing at this order's id."""
+        self._sqs.send_message(
+            QueueUrl=self._queue_url,
+            MessageBody=json.dumps({"order_id": order.order_id}),
+        )
+
+
 class StructuredLogger:
     """Emits the order_id/function/outcome JSON shape CloudWatch queries expect."""
 
@@ -118,20 +134,23 @@ class StructuredLogger:
 class OrderIntakeHandler:
     """Validates an incoming order request and persists it to DynamoDB."""
 
-    def __init__(self, repository: OrderRepository, log: StructuredLogger):
-        """Wire up the repository and logger this handler will use."""
+    def __init__(self, repository: OrderRepository, queue: OrderQueue, log: StructuredLogger):
+        """Wire up the repository, queue, and logger this handler will use."""
         self._repository = repository
+        self._queue = queue
         self._log = log
 
     def handle(self, event: dict) -> dict:
-        """Parse, validate, and save the order from a Function URL event; always returns an HTTP-shaped response."""
+        """Parse, validate, save, and enqueue the order from a Function URL event; always returns an HTTP-shaped response."""
         order_id = None
         try:
             body = json.loads(event.get("body") or "{}")
             request = OrderRequest.from_payload(body)
 
             order = Order.new(request)
+            order_id = order.order_id
             self._repository.save(order)
+            self._queue.publish(order)
 
             self._log.info(order.order_id, "received")
             return self._response(201, {"order_id": order.order_id, "status": order.status})
@@ -159,9 +178,10 @@ class OrderIntakeHandler:
 
 
 def _build_handler() -> OrderIntakeHandler:
-    """Wire up the real DynamoDB table and logger into an OrderIntakeHandler."""
+    """Wire up the real DynamoDB table, SQS queue, and logger into an OrderIntakeHandler."""
     table = boto3.resource("dynamodb").Table(os.environ["ORDERS_TABLE_NAME"])
-    return OrderIntakeHandler(OrderRepository(table), StructuredLogger(logger, "order_intake"))
+    queue = OrderQueue(boto3.client("sqs"), os.environ["ORDERS_QUEUE_URL"])
+    return OrderIntakeHandler(OrderRepository(table), queue, StructuredLogger(logger, "order_intake"))
 
 
 _handler = _build_handler()
