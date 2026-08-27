@@ -72,7 +72,7 @@ Resources:
 Outputs:
   OrderIntakeFunctionUrl:
     Description: Public HTTP endpoint for submitting orders (POST)
-    Value: !GetAtt OrderIntakeFunction.FunctionUrl
+    Value: !GetAtt OrderIntakeFunctionUrl.FunctionUrl
   OrdersTableName:
     Description: Name of the Orders DynamoDB table
     Value: !Ref OrdersTable

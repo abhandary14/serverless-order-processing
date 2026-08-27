@@ -20,12 +20,15 @@ class ValidationError(Exception):
 
 @dataclass(frozen=True)
 class OrderRequest:
+    """A validated order payload, ready to be turned into an Order."""
+
     item_id: str
     quantity: int
     customer_email: str
 
     @classmethod
     def from_payload(cls, body: dict) -> "OrderRequest":
+        """Validate a raw request body and build an OrderRequest, or raise ValidationError."""
         item_id = body.get("item_id")
         quantity = body.get("quantity")
         customer_email = body.get("customer_email")
@@ -42,6 +45,8 @@ class OrderRequest:
 
 @dataclass(frozen=True)
 class Order:
+    """A newly received order, as it will be stored in the Orders table."""
+
     order_id: str
     item_id: str
     quantity: int
@@ -52,6 +57,7 @@ class Order:
 
     @classmethod
     def new(cls, request: OrderRequest) -> "Order":
+        """Create a fresh Order from a validated request, generating its id and timestamps."""
         now = datetime.now(timezone.utc).isoformat()
         return cls(
             order_id=str(uuid.uuid4()),
@@ -64,6 +70,7 @@ class Order:
         )
 
     def to_item(self) -> dict:
+        """Convert this Order into the dict shape DynamoDB's put_item expects."""
         return {
             "order_id": self.order_id,
             "item_id": self.item_id,
@@ -79,9 +86,11 @@ class OrderRepository:
     """Persistence boundary for the Orders table."""
 
     def __init__(self, table):
+        """Wrap the given DynamoDB Table resource."""
         self._table = table
 
     def save(self, order: Order) -> None:
+        """Write an order to the table."""
         self._table.put_item(Item=order.to_item())
 
 
@@ -89,16 +98,20 @@ class StructuredLogger:
     """Emits the order_id/function/outcome JSON shape CloudWatch queries expect."""
 
     def __init__(self, target: logging.Logger, function_name: str):
+        """Wrap a stdlib Logger, tagging every line with the given function name."""
         self._target = target
         self._function_name = function_name
 
     def info(self, order_id, outcome, **extra) -> None:
+        """Log an info-level outcome for the given order."""
         self._target.info(self._payload(order_id, outcome, extra))
 
     def exception(self, order_id, outcome, **extra) -> None:
+        """Log an outcome for the given order, including the current exception's traceback."""
         self._target.exception(self._payload(order_id, outcome, extra))
 
     def _payload(self, order_id, outcome, extra) -> str:
+        """Build the structured JSON log line shared by info and exception."""
         return json.dumps({"order_id": order_id, "function": self._function_name, "outcome": outcome, **extra})
 
 
@@ -106,10 +119,12 @@ class OrderIntakeHandler:
     """Validates an incoming order request and persists it to DynamoDB."""
 
     def __init__(self, repository: OrderRepository, log: StructuredLogger):
+        """Wire up the repository and logger this handler will use."""
         self._repository = repository
         self._log = log
 
     def handle(self, event: dict) -> dict:
+        """Parse, validate, and save the order from a Function URL event; always returns an HTTP-shaped response."""
         order_id = None
         try:
             body = json.loads(event.get("body") or "{}")
@@ -135,6 +150,7 @@ class OrderIntakeHandler:
 
     @staticmethod
     def _response(status_code: int, body: dict) -> dict:
+        """Build the JSON HTTP response shape a Lambda Function URL expects."""
         return {
             "statusCode": status_code,
             "headers": {"Content-Type": "application/json"},
@@ -143,6 +159,7 @@ class OrderIntakeHandler:
 
 
 def _build_handler() -> OrderIntakeHandler:
+    """Wire up the real DynamoDB table and logger into an OrderIntakeHandler."""
     table = boto3.resource("dynamodb").Table(os.environ["ORDERS_TABLE_NAME"])
     return OrderIntakeHandler(OrderRepository(table), StructuredLogger(logger, "order_intake"))
 
@@ -151,4 +168,5 @@ _handler = _build_handler()
 
 
 def lambda_handler(event, context):
+    """Lambda entry point: delegate to the module's OrderIntakeHandler instance."""
     return _handler.handle(event)
