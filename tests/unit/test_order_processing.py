@@ -1,5 +1,5 @@
 import json
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 from botocore.exceptions import ClientError
@@ -10,6 +10,13 @@ app = load_lambda_module(
     "order_processing",
     env={"ORDERS_TABLE_NAME": "test-orders-table", "INVENTORY_TABLE_NAME": "test-inventory-table"},
 )
+
+
+@pytest.fixture(autouse=True)
+def _no_real_sleep():
+    """Prevent tenacity's retry backoff from actually sleeping during tests."""
+    with patch("time.sleep"):
+        yield
 
 
 def _conditional_check_failed():
@@ -171,13 +178,65 @@ class TestOrderProcessingHandler:
         orders.revert_to_received.assert_not_called()
         payment.charge.assert_not_called()
 
-    def test_payment_failure_reverts_to_received_and_reraises(self, handler, orders, inventory, payment):
-        """A payment failure reverts status to received (so a retry can proceed) and propagates for SQS to redeliver."""
+    def test_payment_failure_exhausts_tenacity_then_reverts_and_reraises(self, handler, orders, inventory, payment):
+        """A payment failure is retried in-process 3 times by tenacity; once exhausted, status reverts to received and the error propagates for SQS to redeliver."""
         payment.charge.side_effect = app.PaymentError("simulated failure")
 
         with pytest.raises(app.PaymentError):
             handler.handle(_event("order-1"))
 
+        assert payment.charge.call_count == 3
         orders.revert_to_received.assert_called_once_with("order-1")
         orders.mark_processed.assert_not_called()
         orders.mark_failed.assert_not_called()
+
+    def test_transient_payment_failure_recovers_on_tenacity_retry(self, handler, orders, inventory, payment):
+        """A payment failure that succeeds on a later attempt is recovered in-process, with no revert and no error."""
+        payment.charge.side_effect = [app.PaymentError("transient blip"), "payment-123"]
+
+        handler.handle(_event("order-1"))
+
+        assert payment.charge.call_count == 2
+        orders.record_payment.assert_called_once_with("order-1", "payment-123")
+        orders.mark_processed.assert_called_once_with("order-1")
+        orders.revert_to_received.assert_not_called()
+
+    def test_retries_do_not_double_reserve_inventory(self, inventory, payment):
+        """Across tenacity's retries, inventory is only reserved once, because a stateful redelivery would see inventory_reserved already set."""
+
+        class StatefulFakeOrders:
+            """A minimal in-memory Orders stand-in, so retries see the effect of earlier writes within the same call, like a real table would."""
+
+            def __init__(self):
+                """Seed a fresh order and stub out the methods this test doesn't exercise."""
+                self.order = {"order_id": "order-1", "item_id": "sku-1", "quantity": 2}
+                self.revert_to_received = MagicMock()
+                self.mark_processed = MagicMock()
+                self.mark_failed = MagicMock()
+
+            def begin_processing(self, order_id):
+                """Always succeed, as if this were the only invocation touching the order."""
+                return True
+
+            def get(self, order_id):
+                """Return a copy of the current in-memory order state."""
+                return dict(self.order)
+
+            def mark_inventory_reserved(self, order_id):
+                """Record the reservation in the in-memory order, like a real update_item would."""
+                self.order["inventory_reserved"] = True
+
+            def record_payment(self, order_id, payment_id):
+                """Record the payment id in the in-memory order, like a real update_item would."""
+                self.order["payment_id"] = payment_id
+
+        orders = StatefulFakeOrders()
+        payment.charge.side_effect = app.PaymentError("simulated failure")
+        log = app.StructuredLogger(app.logger, "order_processing")
+        handler = app.OrderProcessingHandler(orders, inventory, payment, log)
+
+        with pytest.raises(app.PaymentError):
+            handler.handle(_event("order-1"))
+
+        assert payment.charge.call_count == 3
+        inventory.reserve.assert_called_once_with("sku-1", 2)

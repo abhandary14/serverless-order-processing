@@ -77,13 +77,23 @@ Resources:
         - AttributeName: item_id
           KeyType: HASH
 
+  OrdersDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "${AWS::StackName}-orders-dlq"
+
   OrdersQueue:
     Type: AWS::SQS::Queue
     Properties:
       QueueName: !Sub "${AWS::StackName}-orders-queue"
-      # Well above tenacity's future ~10s in-process retry window (Phase 3), so tenacity
-      # always finishes before SQS could redeliver. See PROJECT.md's retry strategy section.
+      # Well above tenacity's ~10s in-process retry window, so tenacity always finishes
+      # before SQS could redeliver. See PROJECT.md's retry strategy section.
       VisibilityTimeout: 60
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt OrdersDLQ.Arn
+        # Total separate invocation attempts allowed (each already tenacity-hardened
+        # in-process) before giving up and sending to the DLQ.
+        maxReceiveCount: 3
 
   OrderIntakeFunction:
     Type: AWS::Serverless::Function
@@ -128,6 +138,30 @@ Resources:
             Queue: !GetAtt OrdersQueue.Arn
             BatchSize: 1
 
+  DlqHandlerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-dlq-handler"
+      CodeUri: dlq_handler/
+      Handler: app.lambda_handler
+      Environment:
+        Variables:
+          ORDERS_TABLE_NAME: !Ref OrdersTable
+          INVENTORY_TABLE_NAME: !Ref InventoryTable
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref OrdersTable
+        - DynamoDBWritePolicy:
+            TableName: !Ref OrdersTable
+        - DynamoDBWritePolicy:
+            TableName: !Ref InventoryTable
+      Events:
+        OrdersDLQEvent:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt OrdersDLQ.Arn
+            BatchSize: 1
+
 Outputs:
   OrderIntakeFunctionUrl:
     Description: Public HTTP endpoint for submitting orders (POST)
@@ -141,3 +175,6 @@ Outputs:
   OrdersQueueUrl:
     Description: URL of the SQS queue between Order Intake and Order Processing
     Value: !Ref OrdersQueue
+  OrdersDLQUrl:
+    Description: URL of the dead-letter queue for orders that exhausted all retries
+    Value: !Ref OrdersDLQ

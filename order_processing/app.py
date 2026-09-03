@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 
 import boto3
 from botocore.exceptions import ClientError
+from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -20,6 +21,20 @@ class InsufficientStockError(Exception):
 
 class PaymentError(Exception):
     """Raised when the mock payment gateway simulates a failure."""
+
+
+# Fast, in-process retries only, for transient failures (mock payment failure, DynamoDB
+# throttling) within a single invocation. 3 attempts with backoff up to 4s between them
+# maxes out at a few seconds total - well under the 60s SQS visibility timeout on
+# OrdersQueue, so tenacity always finishes long before SQS could redeliver. Giving up
+# permanently is SQS's job (maxReceiveCount + the DLQ), not tenacity's - see PROJECT.md's
+# retry strategy section.
+_transient_retry = retry(
+    retry=retry_if_exception_type((PaymentError, ClientError)),
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=1, max=4),
+    reraise=True,
+)
 
 
 def _now() -> str:
@@ -188,6 +203,7 @@ class OrderProcessingHandler:
             self._log.exception(order_id, "processing_error_reverted_for_retry")
             raise
 
+    @_transient_retry
     def _process(self, order_id: str) -> None:
         """Reserve inventory and charge payment, skipping any step already completed by a prior attempt."""
         order = self._orders.get(order_id)
