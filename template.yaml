@@ -147,9 +147,14 @@ Resources:
       Environment:
         Variables:
           ORDERS_TABLE_NAME: !Ref OrdersTable
+          INVENTORY_TABLE_NAME: !Ref InventoryTable
       Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref OrdersTable
         - DynamoDBWritePolicy:
             TableName: !Ref OrdersTable
+        - DynamoDBWritePolicy:
+            TableName: !Ref InventoryTable
       Events:
         OrdersDLQEvent:
           Type: SQS
